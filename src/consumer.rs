@@ -740,7 +740,7 @@ struct ConsumerEngine<Exe: Executor> {
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     batch_size: u32,
-    remaining_messages: u32,
+    remaining_messages: i64,
     unacked_message_redelivery_delay: Option<Duration>,
     unacked_messages: HashMap<MessageIdData, Instant>,
     dead_letter_policy: Option<DeadLetterPolicy>,
@@ -785,7 +785,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             messages_rx: Some(messages_rx),
             engine_rx: Some(engine_rx),
             batch_size,
-            remaining_messages: batch_size,
+            remaining_messages: batch_size.into(),
             unacked_message_redelivery_delay,
             unacked_messages: HashMap::new(),
             dead_letter_policy,
@@ -809,22 +809,18 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 }
             }
 
-            if self.remaining_messages < self.batch_size / 2 {
-                match self
-                    .connection
-                    .sender()
-                    .send_flow(self.id, self.batch_size - self.remaining_messages)
-                {
+            if self.remaining_messages < (self.batch_size / 2).into() {
+                let permits = u32::try_from(i64::from(self.batch_size) - self.remaining_messages)
+                    .expect("permits overflow");
+                match self.connection.sender().send_flow(self.id, permits) {
                     Ok(()) => {}
                     Err(ConnectionError::Disconnected) => {
                         self.reconnect().await?;
-                        self.connection
-                            .sender()
-                            .send_flow(self.id, self.batch_size - self.remaining_messages)?;
+                        self.connection.sender().send_flow(self.id, permits)?;
                     }
                     Err(e) => return Err(e.into()),
                 }
-                self.remaining_messages = self.batch_size;
+                self.remaining_messages = self.batch_size.into();
             }
 
             let mut f = match messages_or_ack_f.take() {
@@ -873,8 +869,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                                 .payload
                                 .as_ref()
                                 .and_then(|payload| payload.metadata.num_messages_in_batch)
-                                .unwrap_or(1i32)
-                                as u32;
+                                .map_or(1i64, i64::from);
 
                             match self.process_message(message).await {
                                 // Continue
@@ -1258,7 +1253,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // if we receive a message, it indicates we want to stop this task
             if _res.is_err() {
                 if let Err(e) = conn.sender().close_consumer(id).await {
-                    error!("could not close consumer {:?}({}) for topic {}: {:?}", name, id, topic, e);
+                    error!(
+                        "could not close consumer {:?}({}) for topic {}: {:?}",
+                        name, id, topic, e
+                    );
                 }
             }
         }));
