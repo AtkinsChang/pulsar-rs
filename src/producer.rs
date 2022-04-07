@@ -1,10 +1,11 @@
 //! Message publication
-use futures::{channel::oneshot, future::try_join_all, lock::Mutex};
+use futures::{channel::oneshot, future::try_join_all};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 use crate::client::SerializeMessage;
 use crate::connection::{Connection, SerialId};
@@ -118,7 +119,9 @@ pub struct ProducerOptions {
     /// schema used to encode this producer's messages
     pub schema: Option<Schema>,
     /// batch message size
-    pub batch_size: Option<u32>,
+    pub batch_size: Option<usize>,
+    /// batch timeout
+    pub batch_timeout: Option<Duration>,
     /// algorithm used to compress the messages
     pub compression: Option<proto::CompressionType>,
 }
@@ -327,6 +330,17 @@ impl<Exe: Executor> Producer<Exe> {
         }
     }
 
+    pub async fn send_batch_timeout(&mut self) -> Result<(), Error> {
+        match &mut self.inner {
+            ProducerInner::Single(p) => p.send_batch_if_timeout().await,
+            ProducerInner::Partitioned(p) => {
+                try_join_all(p.producers.iter_mut().map(|p| p.send_batch_if_timeout()))
+                    .await
+                    .map(drop)
+            }
+        }
+    }
+
     /// sends the current batch of messages
     pub async fn send_batch(&mut self) -> Result<(), Error> {
         match &mut self.inner {
@@ -376,7 +390,7 @@ struct TopicProducer<Exe: Executor> {
     message_id: SerialId,
     //putting it in a mutex because we must send multiple messages at once
     // while we might be pushing more messages from elsewhere
-    batch: Option<Mutex<Batch>>,
+    batch: Option<Batch>,
     compression: Option<proto::CompressionType>,
     _drop_signal: oneshot::Sender<()>,
     options: ProducerOptions,
@@ -396,6 +410,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
         let topic = topic.clone();
         let batch_size = options.batch_size;
+        let batch_timeout = options.batch_timeout;
         let compression = options.compression;
 
         match compression {
@@ -497,7 +512,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
             name: producer_name,
             topic,
             message_id: sequence_ids,
-            batch: batch_size.map(Batch::new).map(Mutex::new),
+            batch: batch_size.map(|size| Batch::new(size, batch_timeout)),
             compression,
             _drop_signal,
             options,
@@ -524,6 +539,49 @@ impl<Exe: Executor> TopicProducer<Exe> {
         }
     }
 
+    pub async fn send_batch_if_timeout(&mut self) -> Result<(), Error> {
+        match self.batch.as_ref() {
+            None => Err(ProducerError::Custom("not a batching producer".to_string()).into()),
+            Some(batch) => {
+                if batch.is_timeout().await {
+                    let mut payload: Vec<u8> = Vec::new();
+                    let mut receipts = Vec::new();
+                    let message_count;
+
+                    {
+                        let messages = batch.get_messages().await;
+                        message_count = messages.len();
+                        for (tx, message) in messages {
+                            receipts.push(tx);
+                            message.serialize(&mut payload);
+                        }
+                    }
+
+                    if message_count == 0 {
+                        return Ok(());
+                    }
+
+                    let message = ProducerMessage {
+                        payload,
+                        num_messages_in_batch: Some(message_count as i32),
+                        ..Default::default()
+                    };
+
+                    trace!("sending a batched message of size {}", message_count);
+                    let send_receipt = self.send_compress(message).await.map_err(Arc::new);
+                    for resolver in receipts {
+                        let _ = resolver.send(
+                            send_receipt
+                                .clone()
+                                .map_err(|e| ProducerError::Batch(e).into()),
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     async fn send_batch(&mut self) -> Result<(), Error> {
         match self.batch.as_ref() {
             None => Err(ProducerError::Custom("not a batching producer".to_string()).into()),
@@ -533,7 +591,6 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 let message_count;
 
                 {
-                    let batch = batch.lock().await;
                     let messages = batch.get_messages().await;
                     message_count = messages.len();
                     for (tx, message) in messages {
@@ -581,10 +638,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 let mut counter = 0i32;
 
                 {
-                    let batch = batch.lock().await;
-                    batch.push_back((tx, message)).await;
-
-                    if batch.is_full().await {
+                    if batch.push_back((tx, message)).await {
                         for (tx, message) in batch.get_messages().await {
                             receipts.push(tx);
                             message.serialize(&mut payload);
@@ -755,6 +809,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
         let topic = self.topic.clone();
         let batch_size = self.options.batch_size;
+        let batch_timeout = self.options.batch_timeout;
 
         let mut current_retries = 0u32;
         let start = std::time::Instant::now();
@@ -825,7 +880,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
         // drop_signal will be dropped when the TopicProducer is dropped, then
         // drop_receiver will return, and we can close the producer
         let (_drop_signal, drop_receiver) = oneshot::channel::<()>();
-        let batch = batch_size.map(Batch::new).map(Mutex::new);
+        let batch = batch_size.map(|size| Batch::new(size, batch_timeout));
         let conn = self.connection.clone();
         let producer_id = self.id;
         let _ = self.client.executor.spawn(Box::pin(async move {
@@ -946,28 +1001,37 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
 }
 
 struct Batch {
-    pub length: u32,
+    pub length: usize,
+    pub timeout: Option<Duration>,
     // put it in a mutex because the design of Producer requires an immutable TopicProducer,
     // so we cannot have a mutable Batch in a send_raw(&mut self, ...)
     #[allow(clippy::type_complexity)]
-    pub storage: Mutex<
+    pub storage: RwLock<
         VecDeque<(
             oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
             BatchedMessage,
         )>,
     >,
+    pub first_message_time: RwLock<Instant>,
 }
 
 impl Batch {
-    pub fn new(length: u32) -> Batch {
+    pub fn new(length: usize, timeout: Option<Duration>) -> Batch {
         Batch {
             length,
-            storage: Mutex::new(VecDeque::with_capacity(length as usize)),
+            timeout,
+            storage: RwLock::new(VecDeque::with_capacity(length)),
+            first_message_time: RwLock::new(Instant::now()),
         }
     }
 
     pub async fn is_full(&self) -> bool {
-        self.storage.lock().await.len() >= self.length as usize
+        self.storage.read().await.len() >= self.length
+    }
+
+    pub async fn is_timeout(&self) -> bool {
+        !self.storage.read().await.is_empty()
+            && matches!(self.timeout, Some(timeout) if self.first_message_time.read().await.elapsed() >= timeout)
     }
 
     pub async fn push_back(
@@ -976,7 +1040,7 @@ impl Batch {
             oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
             ProducerMessage,
         ),
-    ) {
+    ) -> bool {
         let (tx, message) = msg;
 
         let properties = message
@@ -994,7 +1058,19 @@ impl Batch {
             },
             payload: message.payload,
         };
-        self.storage.lock().await.push_back((tx, batched))
+
+        let mut storage = self.storage.write().await;
+        storage.push_back((tx, batched));
+        match storage.len() {
+            1 => {
+                *self.first_message_time.write().await = Instant::now();
+                false
+            }
+            length if length >= self.length => true,
+            _ => {
+                matches!(self.timeout, Some(timeout) if self.first_message_time.read().await.elapsed() >= timeout)
+            }
+        }
     }
 
     pub async fn get_messages(
@@ -1003,7 +1079,7 @@ impl Batch {
         oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
         BatchedMessage,
     )> {
-        self.storage.lock().await.drain(..).collect()
+        self.storage.write().await.drain(..).collect()
     }
 }
 
