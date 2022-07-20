@@ -4,7 +4,6 @@ use crate::error::Error;
 use crate::executor::Executor;
 use crate::message::proto::{command_subscribe::SubType, MessageIdData};
 use chrono::{DateTime, Utc};
-use futures::channel::mpsc::SendError;
 use futures::task::{Context, Poll};
 use futures::{Future, SinkExt, Stream};
 use std::pin::Pin;
@@ -13,66 +12,31 @@ use url::Url;
 /// A client that acknowledges messages systematically
 pub struct Reader<T: DeserializeMessage, Exe: Executor> {
     pub(crate) consumer: TopicConsumer<T, Exe>,
-    pub(crate) state: Option<State<T>>,
 }
 
 impl<T: DeserializeMessage + 'static, Exe: Executor> Unpin for Reader<T, Exe> {}
-
-pub enum State<T: DeserializeMessage> {
-    PollingConsumer,
-    PollingAck(
-        Message<T>,
-        Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + Sync>>,
-    ),
-}
 
 impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Reader<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.state.take().unwrap() {
-            State::PollingConsumer => match Pin::new(&mut this.consumer).poll_next(cx) {
-                Poll::Pending => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Pending
-                }
+        match Pin::new(&mut this.consumer).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
 
-                Poll::Ready(None) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(None)
-                }
+            Poll::Ready(None) => Poll::Ready(None),
 
-                Poll::Ready(Some(Ok(msg))) => {
-                    let mut acker = this.consumer.acker();
-                    let message_id = msg.message_id.clone();
-                    this.state = Some(State::PollingAck(
-                        msg,
-                        Box::pin(
-                            async move { acker.send(EngineMessage::Ack(message_id, false)).await },
-                        ),
-                    ));
-                    Pin::new(this).poll_next(cx)
-                }
+            Poll::Ready(Some(Ok(msg))) => {
+                let mut acker = this.consumer.acker();
+                let message_id = msg.message_id.clone();
+                let res = acker.send(EngineMessage::Ack(message_id, false));
+                Poll::Ready(Some(
+                    res.map_err(|err| Error::Consumer(crate::error::ConsumerError::Closed))
+                        .map(|()| msg),
+                ))
+            }
 
-                Poll::Ready(Some(Err(e))) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(Some(Err(e)))
-                }
-            },
-            State::PollingAck(msg, mut ack_fut) => match ack_fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    this.state = Some(State::PollingAck(msg, ack_fut));
-                    Poll::Pending
-                }
-
-                Poll::Ready(res) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(Some(
-                        res.map_err(|err| Error::Consumer(err.into())).map(|()| msg),
-                    ))
-                }
-            },
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
         }
     }
 }

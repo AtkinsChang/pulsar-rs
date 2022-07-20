@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use futures::{
     self,
-    channel::{mpsc, oneshot},
     future::{select, Either},
     pin_mut,
     task::{Context, Poll},
     Future, FutureExt, Sink, SinkExt, Stream, StreamExt,
 };
+use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use crate::consumer::ConsumerOptions;
@@ -30,7 +30,7 @@ use crate::message::{
 };
 use crate::producer::{self, ProducerOptions};
 use async_trait::async_trait;
-use futures::lock::Mutex;
+use tokio::sync::Mutex;
 
 pub(crate) enum Register {
     Request {
@@ -118,15 +118,13 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.shutdown.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) | Poll::Ready(Err(futures::channel::oneshot::Canceled)) => {
-                return Poll::Ready(Err(()))
-            }
+            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => return Poll::Ready(Err(())),
             Poll::Pending => {}
         }
 
         //Are we worried about starvation here?
         loop {
-            match self.registrations.as_mut().poll_next(cx) {
+            match self.registrations.as_mut().poll_recv(cx) {
                 Poll::Ready(Some(Register::Request { key, resolver })) => {
                     match self.received_messages.remove(&key) {
                         Some(msg) => {
@@ -161,7 +159,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                         command: BaseCommand { ping: Some(_), .. },
                         ..
                     } => {
-                        let _ = self.outbound.unbounded_send(messages::pong());
+                        let _ = self.outbound.send(messages::pong());
                     }
                     Message {
                         command: BaseCommand { pong: Some(_), .. },
@@ -186,7 +184,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             let _ = self
                                 .consumers
                                 .get_mut(&consumer_id)
-                                .map(move |consumer| consumer.unbounded_send(msg));
+                                .map(move |consumer| consumer.send(msg));
                         }
                         Some(RequestKey::CloseConsumer {
                             consumer_id,
@@ -204,7 +202,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                                 let res = self
                                     .consumers
                                     .get_mut(&consumer_id)
-                                    .map(move |consumer| consumer.unbounded_send(msg));
+                                    .map(move |consumer| consumer.send(msg));
 
                                 if !res.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
                                     error!("ConnectionReceiver: error transmitting message to consumer: {:?}", res);
@@ -305,9 +303,8 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         trace!("sending ping");
 
         match (
-            self.registrations
-                .unbounded_send(Register::Ping { resolver }),
-            self.tx.unbounded_send(messages::ping()),
+            self.registrations.send(Register::Ping { resolver }),
+            self.tx.send(messages::ping()),
         ) {
             (Ok(_), Ok(_)) => {
                 let delay_f = self.executor.delay(self.operation_timeout);
@@ -316,7 +313,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
 
                 match select(response, delay_f).await {
                     Either::Left((res, _)) => res
-                        .map_err(|oneshot::Canceled| {
+                        .map_err(|_| {
                             self.error.set(ConnectionError::Disconnected);
                             ConnectionError::Disconnected
                         })
@@ -456,7 +453,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             consumer_name,
             options,
         );
-        match self.registrations.unbounded_send(Register::Consumer {
+        match self.registrations.send(Register::Consumer {
             consumer_id,
             resolver,
         }) {
@@ -474,7 +471,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
 
     pub fn send_flow(&self, consumer_id: u64, message_permits: u32) -> Result<(), ConnectionError> {
         self.tx
-            .unbounded_send(messages::flow(consumer_id, message_permits))
+            .send(messages::flow(consumer_id, message_permits))
             .map_err(|_| ConnectionError::Disconnected)
     }
 
@@ -485,7 +482,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         cumulative: bool,
     ) -> Result<(), ConnectionError> {
         self.tx
-            .unbounded_send(messages::ack(consumer_id, message_ids, cumulative))
+            .send(messages::ack(consumer_id, message_ids, cumulative))
             .map_err(|_| ConnectionError::Disconnected)
     }
 
@@ -495,7 +492,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         message_ids: Vec<proto::MessageIdData>,
     ) -> Result<(), ConnectionError> {
         self.tx
-            .unbounded_send(messages::redeliver_unacknowleged_messages(
+            .send(messages::redeliver_unacknowleged_messages(
                 consumer_id,
                 message_ids,
             ))
@@ -556,7 +553,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         let response = async {
             response
                 .await
-                .map_err(|oneshot::Canceled| {
+                .map_err(|_| {
                     self.error.set(ConnectionError::Disconnected);
                     ConnectionError::Disconnected
                 })
@@ -567,9 +564,8 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         };
 
         match (
-            self.registrations
-                .unbounded_send(Register::Request { key, resolver }),
-            self.tx.unbounded_send(msg),
+            self.registrations.send(Register::Request { key, resolver }),
+            self.tx.send(msg),
         ) {
             (Ok(_), Ok(_)) => {
                 let delay_f = self.executor.delay(self.operation_timeout);
@@ -606,7 +602,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         let response = async {
             response
                 .await
-                .map_err(|oneshot::Canceled| {
+                .map_err(|_| {
                     self.error.set(ConnectionError::Disconnected);
                     ConnectionError::Disconnected
                 })
@@ -616,10 +612,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                 })?
         };
 
-        match self
-            .registrations
-            .unbounded_send(Register::Request { key, resolver })
-        {
+        match self.registrations.send(Register::Request { key, resolver }) {
             Ok(_) => {
                 //there should be no timeout for this message
                 pin_mut!(response);
@@ -897,8 +890,8 @@ impl<Exe: Executor> Connection<Exe> {
         }?;
 
         let (mut sink, stream) = stream.split();
-        let (tx, mut rx) = mpsc::unbounded();
-        let (registrations_tx, registrations_rx) = mpsc::unbounded();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         let error = SharedError::new();
         let (receiver_shutdown_tx, receiver_shutdown_rx) = oneshot::channel();
 
@@ -921,7 +914,7 @@ impl<Exe: Executor> Connection<Exe> {
 
         let err = error.clone();
         let res = executor.spawn(Box::pin(async move {
-            while let Some(msg) = rx.next().await {
+            while let Some(msg) = rx.recv().await {
                 // println!("real sent msg: {:?}", msg);
                 if let Err(e) = sink.send(msg).await {
                     err.set(e);

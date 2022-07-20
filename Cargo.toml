@@ -35,9 +35,10 @@ bit-vec = "0.6"
 futures-io = "0.3"
 native-tls = "0.2"
 pem = "1.0.0"
-tokio = { version = "1.0", features = ["rt", "net", "time"], optional = true }
+tokio = { version = "1.0", features = ["rt", "net", "time", "sync"], optional = true }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 async-std = {version = "1.9", features = [ "attributes", "unstable" ], optional = true }
 asynchronous-codec = { version = "0.6", optional = true }
 async-native-tls = { version = "0.3", optional = true }
@@ -62,8 +63,8 @@ tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 prost-build = "0.10.0"
 
 [features]
-default = [ "compression", "tokio-runtime", "async-std-runtime", "auth-oauth2" ]
+default = [ "compression", "tokio-runtime", "auth-oauth2" ]
 compression = [ "lz4", "flate2", "zstd", "snap" ]
-tokio-runtime = [ "tokio", "tokio-util", "tokio-native-tls" ]
+tokio-runtime = [ "tokio", "tokio-util", "tokio-native-tls", "tokio-stream" ]
 async-std-runtime = [ "async-std", "asynchronous-codec", "async-native-tls" ]
 auth-oauth2 = [ "openidconnect", "oauth2", "serde", "serde_json", "data-url" ]

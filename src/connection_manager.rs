@@ -1,13 +1,13 @@
-use crate::connection::{Connection};
+use crate::connection::Connection;
 use crate::error::ConnectionError;
 use crate::executor::Executor;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{channel::oneshot, lock::Mutex};
 use native_tls::Certificate;
 use rand::Rng;
+use tokio::sync::{oneshot, Mutex};
 use url::Url;
 
 /// holds connection information for a broker
@@ -418,8 +418,10 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 }
                 if let Some(strong_conn) = weak_conn.upgrade() {
                     if !strong_conn.is_valid() {
-                        trace!("connection {} is not valid anymore, skip heart beat task",
-                             connection_id);
+                        trace!(
+                            "connection {} is not valid anymore, skip heart beat task",
+                            connection_id
+                        );
                         break;
                     }
                     if let Err(e) = strong_conn.sender().send_ping().await {

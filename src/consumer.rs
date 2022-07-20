@@ -7,14 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use futures::channel::mpsc::unbounded;
 use futures::task::{Context, Poll};
 use futures::{
-    channel::{mpsc, oneshot},
     future::{select, try_join_all, Either},
     pin_mut, Future, FutureExt, SinkExt, Stream, StreamExt,
 };
 use regex::Regex;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::Connection;
 use crate::error::{ConnectionError, ConsumerError, Error};
@@ -26,7 +25,7 @@ use crate::message::{
     BatchedMessage, Message as RawMessage, Metadata, Payload,
 };
 use crate::proto::{BaseCommand, CommandCloseConsumer, CommandConsumerStatsResponse};
-use crate::reader::{Reader, State};
+use crate::reader::Reader;
 use crate::{BrokerAddress, DeserializeMessage, Pulsar};
 use core::iter;
 use rand::distributions::Alphanumeric;
@@ -460,7 +459,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
         } = config.clone();
         let consumer_id = consumer_id.unwrap_or_else(rand::random);
-        let (resolver, messages) = mpsc::unbounded();
+        let (resolver, messages) = mpsc::unbounded_channel();
         let batch_size = batch_size.unwrap_or(1000);
 
         let mut connection = client.manager.get_connection(&addr).await?;
@@ -546,7 +545,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             })
             .map_err(|e| Error::Consumer(ConsumerError::Connection(e)))?;
 
-        let (engine_tx, engine_rx) = unbounded();
+        let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         // drop_signal will be dropped when Consumer is dropped, then
         // drop_receiver will return, and we can close the consumer
         let (_drop_signal, drop_receiver) = oneshot::channel::<()>();
@@ -574,7 +573,6 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 while interval.next().await.is_some() {
                     if redelivery_tx
                         .send(EngineMessage::UnackedRedelivery)
-                        .await
                         .is_err()
                     {
                         // Consumer shut down - stop ticker
@@ -636,10 +634,9 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         let (resolver, response) = oneshot::channel();
         self.engine_tx
             .send(EngineMessage::GetConnection(resolver))
-            .await
             .map_err(|_| ConsumerError::Connection(ConnectionError::Disconnected))?;
 
-        response.await.map_err(|oneshot::Canceled| {
+        response.await.map_err(|_| {
             error!("the consumer engine dropped the request");
             ConnectionError::Disconnected.into()
         })
@@ -662,7 +659,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     pub async fn ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
             .send(EngineMessage::Ack(msg.message_id.clone(), false))
-            .await?;
+            .map_err(|_| ConsumerError::Closed)?;
         Ok(())
     }
 
@@ -673,14 +670,14 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
             .send(EngineMessage::Ack(msg.message_id.clone(), true))
-            .await?;
+            .map_err(|_| ConsumerError::Closed)?;
         Ok(())
     }
 
     async fn nack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
             .send(EngineMessage::Nack(msg.message_id.clone()))
-            .await?;
+            .map_err(|_| ConsumerError::Closed)?;
         Ok(())
     }
 
@@ -744,7 +741,7 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.messages.as_mut().poll_next(cx) {
+        match self.messages.as_mut().poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Ok((id, payload)))) => {
@@ -863,8 +860,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     // and replacing messages_rx when we reconnect, and considering that engine_rx is
                     // not clonable.
                     // Please, someone find a better solution
-                    let messages_f = self.messages_rx.take().unwrap().into_future();
-                    let ack_f = self.engine_rx.take().unwrap().into_future();
+                    let messages_f = tokio_stream::wrappers::UnboundedReceiverStream::new(
+                        self.messages_rx.take().unwrap(),
+                    )
+                    .into_future();
+                    let ack_f = tokio_stream::wrappers::UnboundedReceiverStream::new(
+                        self.engine_rx.take().unwrap(),
+                    )
+                    .into_future();
+
                     select(messages_f, ack_f)
                 }
                 Some(f) => f,
@@ -888,12 +892,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
             match f {
                 Either::Left(((message_opt, messages_rx), engine_rx)) => {
-                    self.messages_rx = Some(messages_rx);
-                    self.engine_rx = engine_rx.into_inner();
+                    self.messages_rx = Some(messages_rx.into_inner());
+                    self.engine_rx = engine_rx.into_inner().map(|s| s.into_inner());
                     match message_opt {
                         None => {
                             error!("Consumer: messages::next: returning Disconnected");
-                            panic!("ConsumerEngine got Disconnected");
+                            // panic!("ConsumerEngine got Disconnected");
                             self.reconnect().await?;
                             continue;
                             //return Err(Error::Consumer(ConsumerError::Connection(ConnectionError::Disconnected)).into());
@@ -916,7 +920,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                                 Err(e) => {
                                     if let Err(e) = self.tx.send(Err(e)).await {
                                         error!("cannot send a message from the consumer engine to the consumer({}), stopping the engine", self.id);
-                                        return Err(Error::Consumer(e.into()));
+                                        return Err(Error::Consumer(
+                                            crate::error::ConsumerError::Closed,
+                                        ));
                                     }
                                 }
                             }
@@ -924,8 +930,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     }
                 }
                 Either::Right(((ack_opt, engine_rx), messages_rx)) => {
-                    self.messages_rx = messages_rx.into_inner();
-                    self.engine_rx = Some(engine_rx);
+                    self.messages_rx = messages_rx.into_inner().map(|stream| stream.into_inner());
+                    self.engine_rx = Some(engine_rx.into_inner());
 
                     match ack_opt {
                         None => {
@@ -1253,7 +1259,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         self.connection = conn;
 
         let topic = self.topic.clone();
-        let (resolver, messages) = mpsc::unbounded();
+        let (resolver, messages) = mpsc::unbounded_channel();
 
         self.connection
             .sender()
@@ -1686,10 +1692,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         let (topic, addr) = joined_topics.pop().unwrap();
         let consumer = TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone()).await?;
 
-        Ok(Reader {
-            consumer,
-            state: Some(State::PollingConsumer),
-        })
+        Ok(Reader { consumer })
     }
 }
 
@@ -1778,7 +1781,8 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
     }
 
     async fn get_last_message_id(&mut self) -> Result<Vec<MessageIdData>, Error> {
-        let responses = try_join_all(self.consumers.values_mut().map(|c| c.get_last_message_id())).await?;
+        let responses =
+            try_join_all(self.consumers.values_mut().map(|c| c.get_last_message_id())).await?;
         Ok(responses)
     }
 

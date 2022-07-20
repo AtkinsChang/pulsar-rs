@@ -1,10 +1,12 @@
 //! Message publication
-use futures::{channel::oneshot, future::try_join_all, lock::Mutex};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use futures::future::try_join_all;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::client::SerializeMessage;
 use crate::connection::{self, Connection, SerialId};

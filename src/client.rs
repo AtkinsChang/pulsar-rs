@@ -1,7 +1,7 @@
 use std::string::FromUtf8Error;
 use std::sync::Arc;
 
-use futures::channel::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::connection::Authentication;
 use crate::connection_manager::{
@@ -15,7 +15,6 @@ use crate::message::Payload;
 use crate::producer::{self, ProducerBuilder, SendFuture};
 use crate::service_discovery::ServiceDiscovery;
 use futures::StreamExt;
-use futures::lock::Mutex;
 
 /// Helper trait for consumer deserialization
 pub trait DeserializeMessage {
@@ -199,7 +198,7 @@ impl<Exe: Executor> Pulsar<Exe> {
         }
 
         let service_discovery = Arc::new(ServiceDiscovery::with_manager(manager.clone()));
-        let (producer, producer_rx) = mpsc::unbounded();
+        let (producer, producer_rx) = mpsc::unbounded_channel();
 
         let mut client = Pulsar {
             manager,
@@ -411,7 +410,7 @@ impl<Exe: Executor> Pulsar<Exe> {
         self.producer
             .as_ref()
             .expect("a client without the producer channel should only be used internally")
-            .unbounded_send(SendMessage {
+            .send(SendMessage {
                 topic: topic.into(),
                 message,
                 resolver,
@@ -437,7 +436,10 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
         self.with_auth_provider(Box::new(auth))
     }
 
-    pub fn with_auth_provider(mut self, auth: Box<dyn crate::authentication::Authentication>) -> Self {
+    pub fn with_auth_provider(
+        mut self,
+        auth: Box<dyn crate::authentication::Authentication>,
+    ) -> Self {
         self.auth_provider = Some(auth);
         self
     }
@@ -552,7 +554,7 @@ async fn run_producer<Exe: Executor>(
         topic,
         message: payload,
         resolver,
-    }) = messages.next().await
+    }) = messages.recv().await
     {
         match producer.send(topic, payload).await {
             Ok(future) => {
