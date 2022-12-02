@@ -501,7 +501,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
         } = config.clone();
         let consumer_id = consumer_id.unwrap_or_else(rand::random);
-        let (resolver, messages) = mpsc::unbounded();
+        let (messages_tx, messages_rx) = mpsc::unbounded();
         let batch_size = batch_size.unwrap_or(1000);
 
         let mut connection = client.manager.get_connection(&addr).await?;
@@ -513,7 +513,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             match connection
                 .sender()
                 .subscribe(
-                    resolver.clone(),
+                    messages_tx.clone(),
                     topic.clone(),
                     subscription.clone(),
                     sub_type,
@@ -636,7 +636,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             consumer_id,
             name,
             tx,
-            messages,
+            messages_tx,
+            messages_rx,
             engine_rx,
             batch_size,
             unacked_message_redelivery_delay,
@@ -827,6 +828,7 @@ struct ConsumerEngine<Exe: Executor> {
     id: u64,
     name: Option<String>,
     tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+    messages_tx: mpsc::UnboundedSender<RawMessage>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
@@ -858,6 +860,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         id: u64,
         name: Option<String>,
         tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+        messages_tx: mpsc::UnboundedSender<RawMessage>,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
         batch_size: u32,
@@ -876,6 +879,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             id,
             name,
             tx,
+            messages_tx,
             messages_rx: Some(messages_rx),
             engine_rx: Some(engine_rx),
             event_rx,
@@ -1349,34 +1353,86 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
-        let broker_address = self.client.lookup_topic(&self.topic).await?;
-        let conn = self.client.manager.get_connection(&broker_address).await?;
-
-        self.connection = conn;
-
+        let mut broker_address = self.client.lookup_topic(&self.topic).await?;
+        let mut conn = self.client.manager.get_connection(&broker_address).await?;
+        let mut current_retries = 0u32;
+        let start = Instant::now();
+        let operation_retry_options = self.client.operation_retry_options.clone();
         let topic = self.topic.clone();
-        let (resolver, messages) = mpsc::unbounded();
 
-        self.connection
-            .sender()
-            .subscribe(
-                resolver,
-                topic.clone(),
-                self.subscription.clone(),
-                self.sub_type,
-                self.id,
-                self.name.clone(),
-                self.options.clone(),
-            )
-            .await
-            .map_err(Error::Connection)?;
+        loop {
+            match conn
+                .sender()
+                .subscribe(
+                    self.messages_tx.clone(),
+                    topic.clone(),
+                    self.subscription.clone(),
+                    self.sub_type,
+                    self.id,
+                    self.name.clone(),
+                    self.options.clone(),
+                )
+                .await {
+                    Ok(_) => {
+                        if current_retries > 0 {
+                            let dur = (Instant::now() - start).as_secs();
+                            log::info!(
+                                "subscribe({}) success after {} retries over {} seconds",
+                                topic,
+                                current_retries + 1,
+                                dur
+                            );
+                        }
+                        break;
+                    }
+                    Err(ConnectionError::PulsarError(
+                        Some(proto::ServerError::ServiceNotReady),
+                        text,
+                    )) => {
+                        if operation_retry_options.max_retries.is_none()
+                            || operation_retry_options.max_retries.unwrap() > current_retries
+                        {
+                            error!("subscribe({}) answered ServiceNotReady, retrying request after {}ms (max_retries = {:?}): {}",
+                            topic, operation_retry_options.retry_delay.as_millis(),
+                            operation_retry_options.max_retries, text.unwrap_or_default());
+
+                            current_retries += 1;
+                            self.client
+                                .executor
+                                .delay(operation_retry_options.retry_delay)
+                                .await;
+
+                            // we need to look up again the topic's address
+                            let prev = broker_address;
+                            broker_address = self.client.lookup_topic(&topic).await?;
+                            if prev != broker_address {
+                                info!(
+                                    "topic {} moved: previous = {:?}, new = {:?}",
+                                    topic, prev, broker_address
+                                );
+                            }
+
+                            conn = self.client.manager.get_connection(&broker_address).await?;
+                            continue;
+                        } else {
+                            error!("subscribe({}) reached max retries", topic);
+
+                            return Err(ConnectionError::PulsarError(
+                                Some(proto::ServerError::ServiceNotReady),
+                                text,
+                            )
+                            .into());
+                        }
+                    }
+                    Err(e) => return Err(Error::Connection(e)),
+            }
+        }
+        self.connection = conn;
 
         self.connection
             .sender()
             .send_flow(self.id, self.batch_size)
             .map_err(|e| Error::Consumer(ConsumerError::Connection(e)))?;
-
-        self.messages_rx = Some(messages);
 
         // drop_signal will be dropped when Consumer is dropped, then
         // drop_receiver will return, and we can close the consumer
